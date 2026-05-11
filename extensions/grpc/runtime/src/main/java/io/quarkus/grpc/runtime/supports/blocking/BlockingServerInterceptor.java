@@ -3,7 +3,6 @@ package io.quarkus.grpc.runtime.supports.blocking;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -289,6 +288,10 @@ public class BlockingServerInterceptor implements ServerInterceptor, Function<St
                 blockingHandler = new DevModeBlockingExecutionHandler(Thread.currentThread().getContextClassLoader(),
                         blockingHandler);
             }
+            // Written outside the lock intentionally: gRPC guarantees sequential event
+            // delivery on the event loop, so no concurrent scheduleOrEnqueue call can
+            // race with this write. The volatile keyword ensures the worker thread's
+            // subsequent write of false (under the lock) is visible to the event loop.
             this.isConsumingFromIncomingEvents = true;
             vertx.executeBlocking(blockingHandler, false).onComplete(p -> {
                 ReplayEvent<ReqT> next;
@@ -395,6 +398,7 @@ public class BlockingServerInterceptor implements ServerInterceptor, Function<St
                 blockingHandler = new DevModeBlockingExecutionHandler(Thread.currentThread().getContextClassLoader(),
                         blockingHandler);
             }
+            // See the analogous comment in executeBlockingWithRequestContext.
             this.isConsumingFromIncomingEvents = true;
             var finalBlockingHandler = blockingHandler;
             virtualThreadExecutor.execute(() -> {
@@ -472,49 +476,34 @@ public class BlockingServerInterceptor implements ServerInterceptor, Function<St
         if (halfCloseIndex < 0) {
             return;
         }
-        // Pull any MESSAGE events that follow the first HALF_CLOSE and insert them
-        // immediately before it, preserving their relative order.
-        Deque<ReplayEvent<ReqT>> rebuilt = new ArrayDeque<>(queue.size());
+        // Collect MESSAGE events that appear after the first HALF_CLOSE.
         Deque<ReplayEvent<ReqT>> messagesAfterHalfClose = new ArrayDeque<>();
-        Iterator<ReplayEvent<ReqT>> it = queue.iterator();
         int idx = 0;
-        while (it.hasNext()) {
-            ReplayEvent<ReqT> event = it.next();
+        for (ReplayEvent<ReqT> event : queue) {
             if (idx > halfCloseIndex && event.kind == EventKind.MESSAGE) {
                 messagesAfterHalfClose.add(event);
-            } else if (idx == halfCloseIndex) {
-                // skip; re-added after the messages
-            } else {
-                rebuilt.add(event);
             }
             idx++;
         }
         if (messagesAfterHalfClose.isEmpty()) {
-            return;
+            return; // already ordered correctly — nothing to do
         }
-        // Now reassemble: everything before the half-close, then promoted messages,
-        // then the half-close itself, then everything after that was not a message.
-        Deque<ReplayEvent<ReqT>> finalOrder = new ArrayDeque<>(queue.size());
+        // Rebuild: prefix before HALF_CLOSE, promoted messages, HALF_CLOSE, remaining non-messages.
+        Deque<ReplayEvent<ReqT>> result = new ArrayDeque<>(queue.size());
         idx = 0;
-        boolean halfCloseInserted = false;
         for (ReplayEvent<ReqT> event : queue) {
             if (idx < halfCloseIndex) {
-                finalOrder.add(event);
+                result.add(event);
             } else if (idx == halfCloseIndex) {
-                finalOrder.addAll(messagesAfterHalfClose);
-                finalOrder.add(event);
-                halfCloseInserted = true;
+                result.addAll(messagesAfterHalfClose);
+                result.add(event); // the HALF_CLOSE itself
             } else if (event.kind != EventKind.MESSAGE) {
-                finalOrder.add(event);
+                result.add(event); // non-message events after HALF_CLOSE are preserved
             }
             idx++;
         }
-        if (!halfCloseInserted) {
-            // Defensive; should be unreachable given halfCloseIndex was set above.
-            return;
-        }
         queue.clear();
-        queue.addAll(finalOrder);
+        queue.addAll(result);
     }
 
     private enum EventKind {

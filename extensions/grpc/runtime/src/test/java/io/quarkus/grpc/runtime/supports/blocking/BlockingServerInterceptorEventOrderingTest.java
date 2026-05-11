@@ -154,6 +154,141 @@ class BlockingServerInterceptorEventOrderingTest {
                 .containsExactly("onMessage:hi", "onHalfClose");
     }
 
+    /**
+     * Happy-path: events arrive in the correct order on the virtual-thread path.
+     * The reordering logic must not disturb a queue that is already correctly ordered.
+     */
+    @Test
+    @Timeout(10)
+    void virtualThreadPath_preservesCorrectOrderWhenEventsArriveInOrder() throws Exception {
+        BlockingServerInterceptor interceptor = newInterceptor(Collections.emptyList(),
+                Collections.singletonList("unary"));
+
+        ServerCall serverCall = mock(ServerCall.class);
+        MethodDescriptor methodDescriptor = mock(MethodDescriptor.class);
+        when(methodDescriptor.getFullMethodName()).thenReturn("my-service/unary");
+        when(methodDescriptor.getType()).thenReturn(MethodDescriptor.MethodType.UNARY);
+        when(serverCall.getMethodDescriptor()).thenReturn(methodDescriptor);
+
+        RecordingServerCallHandler next = new RecordingServerCallHandler();
+        ServerCall.Listener replayListener = interceptor.interceptCall(serverCall, new Metadata(), next);
+
+        // Events arrive in the correct order: onMessage before onHalfClose.
+        replayListener.onMessage("hi");
+        replayListener.onHalfClose();
+
+        runAllDeferredTasks();
+
+        next.awaitEvents(2);
+        assertThat(next.events)
+                .as("correctly ordered events must not be reordered")
+                .containsExactly("onMessage:hi", "onHalfClose");
+    }
+
+    /**
+     * Happy-path: events arrive in the correct order on the blocking path.
+     */
+    @Test
+    @Timeout(10)
+    void blockingPath_preservesCorrectOrderWhenEventsArriveInOrder() throws Exception {
+        BlockingServerInterceptor interceptor = newInterceptor(Collections.singletonList("unary"),
+                Collections.emptyList());
+
+        ServerCall serverCall = mock(ServerCall.class);
+        MethodDescriptor methodDescriptor = mock(MethodDescriptor.class);
+        when(methodDescriptor.getFullMethodName()).thenReturn("my-service/unary");
+        when(methodDescriptor.getType()).thenReturn(MethodDescriptor.MethodType.UNARY);
+        when(serverCall.getMethodDescriptor()).thenReturn(methodDescriptor);
+
+        RecordingServerCallHandler next = new RecordingServerCallHandler();
+        next.startCallGate.set(true);
+
+        ServerCall.Listener replayListener = interceptor.interceptCall(serverCall, new Metadata(), next);
+
+        // Events arrive in the correct order while the worker thread is still blocked.
+        replayListener.onMessage("hi");
+        replayListener.onHalfClose();
+
+        next.startCallGate.set(false);
+        synchronized (next.startCallGate) {
+            next.startCallGate.notifyAll();
+        }
+
+        next.awaitEvents(2);
+        assertThat(next.events)
+                .as("correctly ordered events must not be reordered")
+                .containsExactly("onMessage:hi", "onHalfClose");
+    }
+
+    /**
+     * Verifies that when multiple messages are queued after {@code onHalfClose}, all of them
+     * are promoted before the half-close and their relative order is preserved.
+     * Queue before fix: [onHalfClose, onMessage:first, onMessage:second]
+     * Expected after fix: [onMessage:first, onMessage:second, onHalfClose]
+     */
+    @Test
+    @Timeout(10)
+    void virtualThreadPath_promotesMultipleMessagesBeforeHalfClose() throws Exception {
+        BlockingServerInterceptor interceptor = newInterceptor(Collections.emptyList(),
+                Collections.singletonList("unary"));
+
+        ServerCall serverCall = mock(ServerCall.class);
+        MethodDescriptor methodDescriptor = mock(MethodDescriptor.class);
+        when(methodDescriptor.getFullMethodName()).thenReturn("my-service/unary");
+        when(methodDescriptor.getType()).thenReturn(MethodDescriptor.MethodType.UNARY);
+        when(serverCall.getMethodDescriptor()).thenReturn(methodDescriptor);
+
+        RecordingServerCallHandler next = new RecordingServerCallHandler();
+        ServerCall.Listener replayListener = interceptor.interceptCall(serverCall, new Metadata(), next);
+
+        // All three arrive before the deferred executor runs.
+        replayListener.onHalfClose();
+        replayListener.onMessage("first");
+        replayListener.onMessage("second");
+
+        runAllDeferredTasks();
+
+        next.awaitEvents(3);
+        assertThat(next.events)
+                .as("both messages must be promoted before onHalfClose, preserving their relative order")
+                .containsExactly("onMessage:first", "onMessage:second", "onHalfClose");
+    }
+
+    /**
+     * Same multi-message promotion on the blocking ({@code @Blocking}) path.
+     */
+    @Test
+    @Timeout(10)
+    void blockingPath_promotesMultipleMessagesBeforeHalfClose() throws Exception {
+        BlockingServerInterceptor interceptor = newInterceptor(Collections.singletonList("unary"),
+                Collections.emptyList());
+
+        ServerCall serverCall = mock(ServerCall.class);
+        MethodDescriptor methodDescriptor = mock(MethodDescriptor.class);
+        when(methodDescriptor.getFullMethodName()).thenReturn("my-service/unary");
+        when(methodDescriptor.getType()).thenReturn(MethodDescriptor.MethodType.UNARY);
+        when(serverCall.getMethodDescriptor()).thenReturn(methodDescriptor);
+
+        RecordingServerCallHandler next = new RecordingServerCallHandler();
+        next.startCallGate.set(true);
+
+        ServerCall.Listener replayListener = interceptor.interceptCall(serverCall, new Metadata(), next);
+
+        replayListener.onHalfClose();
+        replayListener.onMessage("first");
+        replayListener.onMessage("second");
+
+        next.startCallGate.set(false);
+        synchronized (next.startCallGate) {
+            next.startCallGate.notifyAll();
+        }
+
+        next.awaitEvents(3);
+        assertThat(next.events)
+                .as("both messages must be promoted before onHalfClose, preserving their relative order")
+                .containsExactly("onMessage:first", "onMessage:second", "onHalfClose");
+    }
+
     private BlockingServerInterceptor newInterceptor(List<String> blocking, List<String> virtual) {
         return new BlockingServerInterceptor(vertx, blocking, virtual, controllableVirtualExecutor, false) {
             @Override
