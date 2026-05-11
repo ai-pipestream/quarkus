@@ -288,10 +288,14 @@ public class BlockingServerInterceptor implements ServerInterceptor, Function<St
                 blockingHandler = new DevModeBlockingExecutionHandler(Thread.currentThread().getContextClassLoader(),
                         blockingHandler);
             }
-            // Written outside the lock intentionally: gRPC guarantees sequential event
-            // delivery on the event loop, so no concurrent scheduleOrEnqueue call can
-            // race with this write. The volatile keyword ensures the worker thread's
-            // subsequent write of false (under the lock) is visible to the event loop.
+            // Written outside the lock intentionally: this method is only ever called from
+            // the event loop thread (directly or via the onComplete handler which is also
+            // on the event loop). gRPC guarantees sequential event delivery on the event
+            // loop, so no concurrent scheduleOrEnqueue call can race with this true-write.
+            // The transition back to false is done under the lock because it happens on the
+            // worker thread (where a concurrent scheduleOrEnqueue from the event loop could
+            // otherwise observe a stale false and bypass the queue). The volatile keyword
+            // ensures both transitions are immediately visible across threads.
             this.isConsumingFromIncomingEvents = true;
             vertx.executeBlocking(blockingHandler, false).onComplete(p -> {
                 ReplayEvent<ReqT> next;
